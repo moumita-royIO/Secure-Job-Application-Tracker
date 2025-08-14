@@ -32,23 +32,19 @@ resource "aws_iam_role" "lambda_exec_role" {
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-      }
-    ]
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
   })
 }
 
 ########################################
-# IAM Policy for DynamoDB Access
+# IAM Policy for DynamoDB + SNS Access + CloudWatch
 ########################################
-resource "aws_iam_role_policy" "lambda_dynamodb_policy" {
-  name = "lambda_dynamodb_policy"
+resource "aws_iam_role_policy" "lambda_policy" {
+  name = "lambda_policy"
   role = aws_iam_role.lambda_exec_role.id
 
   policy = jsonencode({
@@ -60,23 +56,38 @@ resource "aws_iam_role_policy" "lambda_dynamodb_policy" {
           "dynamodb:PutItem",
           "dynamodb:GetItem",
           "dynamodb:Scan",
+          "dynamodb:UpdateItem",
           "dynamodb:DeleteItem"
         ]
         Resource = aws_dynamodb_table.job_tracker.arn
+      },
+      {
+        Effect = "Allow"
+        Action = ["sns:Publish"]
+        Resource = "*"  # can restrict to your SNS topic ARN manually
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "*"
       }
     ]
   })
 }
 
 ########################################
-# Lambda Function
+# Add Job Lambda
 ########################################
-resource "aws_lambda_function" "job_tracker_lambda" {
-  filename         = "lambda.zip"
-  function_name    = "JobTrackerLambda"
-  role             = aws_iam_role.lambda_exec_role.arn
-  handler          = "index.handler" # index.py → handler() function
-  runtime          = "python3.9"
+resource "aws_lambda_function" "add_job_lambda" {
+  filename      = "add_job_lambda.zip"
+  function_name = "AddJobLambda"
+  role          = aws_iam_role.lambda_exec_role.arn
+  handler       = "add_job_lambda.add_job_handler"
+  runtime       = "python3.11"
 
   environment {
     variables = {
@@ -86,7 +97,7 @@ resource "aws_lambda_function" "job_tracker_lambda" {
 }
 
 ########################################
-# API Gateway
+# API Gateway for Add Job Lambda
 ########################################
 resource "aws_apigatewayv2_api" "job_tracker_api" {
   name          = "JobTrackerAPI"
@@ -96,7 +107,7 @@ resource "aws_apigatewayv2_api" "job_tracker_api" {
 resource "aws_apigatewayv2_integration" "lambda_integration" {
   api_id           = aws_apigatewayv2_api.job_tracker_api.id
   integration_type = "AWS_PROXY"
-  integration_uri  = aws_lambda_function.job_tracker_lambda.invoke_arn
+  integration_uri  = aws_lambda_function.add_job_lambda.invoke_arn
 }
 
 resource "aws_apigatewayv2_route" "post_jobs" {
@@ -111,13 +122,50 @@ resource "aws_apigatewayv2_stage" "job_tracker_stage" {
   auto_deploy = true
 }
 
-########################################
-# Lambda Permission for API Gateway
-########################################
 resource "aws_lambda_permission" "apigw_invoke_lambda" {
   statement_id  = "AllowAPIGatewayInvoke"
   action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.job_tracker_lambda.function_name
+  function_name = aws_lambda_function.add_job_lambda.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.job_tracker_api.execution_arn}/*/*"
+}
+
+########################################
+# Notification Lambda
+########################################
+resource "aws_lambda_function" "notify_jobs_lambda" {
+  filename      = "notify_jobs_lambda.zip"
+  function_name = "NotifyJobsLambda"
+  role          = aws_iam_role.lambda_exec_role.arn
+  handler       = "notify_jobs_lambda.notify_old_jobs_handler"
+  runtime       = "python3.11"
+
+  environment {
+    variables = {
+      TABLE_NAME    = aws_dynamodb_table.job_tracker.name
+      SNS_TOPIC_ARN = "arn:aws:sns:xxx:xxxxx:YourTopicName"  # Replace with the SNS topic ARN
+    }
+  }
+}
+
+########################################
+# EventBridge Schedule for Notification Lambda
+########################################
+resource "aws_cloudwatch_event_rule" "daily_schedule" {
+  name                = "DailyJobNotification"
+  schedule_expression = "rate(1 day)"
+}
+
+resource "aws_cloudwatch_event_target" "notify_lambda_target" {
+  rule      = aws_cloudwatch_event_rule.daily_schedule.name
+  target_id = "NotifyJobsLambda"
+  arn       = aws_lambda_function.notify_jobs_lambda.arn
+}
+
+resource "aws_lambda_permission" "allow_eventbridge" {
+  statement_id  = "AllowExecutionFromEventBridge"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.notify_jobs_lambda.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.daily_schedule.arn
 }
